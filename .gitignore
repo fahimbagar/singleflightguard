@@ -1,0 +1,23 @@
+# Go build/test artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+*.prof
+/bin/
+/dist/
+
+# go test -cover, go build -o output left in place
+coverage.txt
+coverage.html
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# OS
+.DS_Store
