@@ -27,3 +27,15 @@ type Recorder interface {
 	// operation.
 	IncDrift(op string)
 }
+
+// NoopRecorder is a Recorder that discards every event. It is the default
+// used by New when no Recorder is configured via WithRecorder.
+type NoopRecorder struct{}
+
+func (NoopRecorder) IncCall(string)                        {}
+func (NoopRecorder) IncSuppressed(string)                  {}
+func (NoopRecorder) ObserveDuration(string, time.Duration) {}
+func (NoopRecorder) IncCollision(string)                   {}
+func (NoopRecorder) IncDrift(string)                       {}
+
+var _ Recorder = NoopRecorder{}
