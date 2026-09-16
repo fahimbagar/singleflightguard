@@ -19,3 +19,33 @@ type CollisionFunc[I comparable] func(op, key string, prev, cur I)
 func WithOnCollision[I comparable](f CollisionFunc[I]) Option[I] {
 	return func(g *Guard[I]) { g.onCollision = f }
 }
+
+// DriftFunc is invoked when a Do call's key structural fingerprint differs
+// from the fingerprint previously established for the operation. That
+// difference is the signal that call sites are building keys
+// inconsistently. Set one via WithOnDrift.
+type DriftFunc func(op, key, prevShape, curShape string)
+
+// WithOnDrift sets the callback invoked when key drift is detected (a
+// call's key shape differs from the operation's established shape).
+//
+// Same locking caveat as WithOnCollision: f runs under the Guard's
+// internal mutex, so keep it cheap.
+func WithOnDrift[I comparable](f DriftFunc) Option[I] {
+	return func(g *Guard[I]) { g.onDrift = f }
+}
+
+// WithKeyShape overrides the structural fingerprint function used for
+// drift detection. Defaults to DefaultKeyShape.
+func WithKeyShape[I comparable](fn KeyShapeFunc) Option[I] {
+	return func(g *Guard[I]) { g.keyShape = fn }
+}
+
+// WithDriftDetection enables or disables drift detection. Enabled by
+// default; disable it for operations where key shape is expected to vary
+// legitimately (e.g. keys built from a variable-length identity list) and
+// where DefaultKeyShape's heuristic would otherwise produce false
+// positives you don't want to tune away with WithKeyShape.
+func WithDriftDetection[I comparable](enabled bool) Option[I] {
+	return func(g *Guard[I]) { g.driftDetection = enabled }
+}

@@ -26,10 +26,15 @@ type Guard[I comparable] struct {
 
 	op string
 
-	onCollision CollisionFunc[I]
+	onCollision    CollisionFunc[I]
+	onDrift        DriftFunc
+	driftDetection bool
+	keyShape       KeyShapeFunc
 
 	mu           sync.Mutex
 	seenIdentity map[string]I
+	baseShape    string
+	haveShape    bool
 }
 
 // New creates a Guard for the named operation, with its own dedicated
@@ -44,9 +49,11 @@ type Guard[I comparable] struct {
 // to catch: calls Guard can't see, colliding with calls it can.
 func New[I comparable](op string, opts ...Option[I]) *Guard[I] {
 	g := &Guard[I]{
-		group:        &singleflight.Group{},
-		op:           op,
-		seenIdentity: make(map[string]I),
+		group:          &singleflight.Group{},
+		op:             op,
+		driftDetection: true,
+		keyShape:       DefaultKeyShape,
+		seenIdentity:   make(map[string]I),
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -66,8 +73,9 @@ func (g *Guard[I]) Do(key string, identity I, fn func() (any, error)) (v any, er
 	return g.group.Do(key, fn)
 }
 
-// check records identity against the history recorded for key, reporting
-// a collision if a different identity has already been seen for key.
+// check records identity and key shape against the history recorded for
+// this operation, reporting a collision or a drift event if either check
+// fails.
 func (g *Guard[I]) check(key string, identity I) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -78,5 +86,15 @@ func (g *Guard[I]) check(key string, identity I) {
 		}
 	} else {
 		g.seenIdentity[key] = identity
+	}
+
+	if g.driftDetection {
+		shape := g.keyShape(key)
+		if !g.haveShape {
+			g.baseShape = shape
+			g.haveShape = true
+		} else if shape != g.baseShape && g.onDrift != nil {
+			g.onDrift(g.op, key, g.baseShape, shape)
+		}
 	}
 }
