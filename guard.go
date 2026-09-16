@@ -26,6 +26,8 @@ type Guard[I comparable] struct {
 
 	op string
 
+	onCollision CollisionFunc[I]
+
 	mu           sync.Mutex
 	seenIdentity map[string]I
 }
@@ -50,4 +52,31 @@ func New[I comparable](op string, opts ...Option[I]) *Guard[I] {
 		opt(g)
 	}
 	return g
+}
+
+// Do runs fn under singleflight coordination for key, after checking key
+// against the identity history recorded for this operation.
+//
+// The return shape matches singleflight.Group.Do exactly: the value, any
+// error from fn, and whether the result was shared with another in-flight
+// caller. Existing code calling sf.Do(key, fn) can switch to
+// guard.Do(key, identity, fn) with no other changes.
+func (g *Guard[I]) Do(key string, identity I, fn func() (any, error)) (v any, err error, shared bool) {
+	g.check(key, identity)
+	return g.group.Do(key, fn)
+}
+
+// check records identity against the history recorded for key, reporting
+// a collision if a different identity has already been seen for key.
+func (g *Guard[I]) check(key string, identity I) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	if prev, ok := g.seenIdentity[key]; ok {
+		if prev != identity && g.onCollision != nil {
+			g.onCollision(g.op, key, prev, identity)
+		}
+	} else {
+		g.seenIdentity[key] = identity
+	}
 }
