@@ -13,9 +13,9 @@ type CollisionFunc[I comparable] func(op, key string, prev, cur I)
 // detected (two calls, same key, different identities). Use it to log the
 // colliding identities with enough detail to fix the key formula.
 //
-// f runs while the Guard holds its internal per-operation mutex, so keep
-// it cheap: a slow callback blocks every other Do call for that operation
-// for as long as it runs.
+// f runs while the Guard holds its internal per-operation mutex (see
+// Recorder.IncCollision), so keep it cheap: a slow callback blocks every
+// other Do call for that operation for as long as it runs.
 func WithOnCollision[I comparable](f CollisionFunc[I]) Option[I] {
 	return func(g *Guard[I]) { g.onCollision = f }
 }
@@ -48,4 +48,10 @@ func WithKeyShape[I comparable](fn KeyShapeFunc) Option[I] {
 // positives you don't want to tune away with WithKeyShape.
 func WithDriftDetection[I comparable](enabled bool) Option[I] {
 	return func(g *Guard[I]) { g.driftDetection = enabled }
+}
+
+// WithRecorder sets the Recorder that receives call/collision/drift
+// metrics. Defaults to NoopRecorder.
+func WithRecorder[I comparable](r Recorder) Option[I] {
+	return func(g *Guard[I]) { g.recorder = r }
 }

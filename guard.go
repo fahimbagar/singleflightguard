@@ -2,6 +2,7 @@ package singleflightguard
 
 import (
 	"sync"
+	"time"
 
 	"golang.org/x/sync/singleflight"
 )
@@ -26,6 +27,7 @@ type Guard[I comparable] struct {
 
 	op string
 
+	recorder       Recorder
 	onCollision    CollisionFunc[I]
 	onDrift        DriftFunc
 	driftDetection bool
@@ -51,6 +53,7 @@ func New[I comparable](op string, opts ...Option[I]) *Guard[I] {
 	g := &Guard[I]{
 		group:          &singleflight.Group{},
 		op:             op,
+		recorder:       NoopRecorder{},
 		driftDetection: true,
 		keyShape:       DefaultKeyShape,
 		seenIdentity:   make(map[string]I),
@@ -69,8 +72,28 @@ func New[I comparable](op string, opts ...Option[I]) *Guard[I] {
 // caller. Existing code calling sf.Do(key, fn) can switch to
 // guard.Do(key, identity, fn) with no other changes.
 func (g *Guard[I]) Do(key string, identity I, fn func() (any, error)) (v any, err error, shared bool) {
+	start := time.Now()
+	g.recorder.IncCall(g.op)
+
 	g.check(key, identity)
-	return g.group.Do(key, fn)
+
+	// singleflight.Group only ever invokes the leader caller's fn for a
+	// given in-flight key; every other caller's fn argument is discarded
+	// unused. executed therefore tells us, for *this* call specifically,
+	// whether it did the upstream work or was suppressed in favor of an
+	// in-flight call. That's different from the shared return value below,
+	// which is true for every member of a shared group, leader included.
+	var executed bool
+	v, err, shared = g.group.Do(key, func() (any, error) {
+		executed = true
+		return fn()
+	})
+
+	g.recorder.ObserveDuration(g.op, time.Since(start))
+	if !executed {
+		g.recorder.IncSuppressed(g.op)
+	}
+	return v, err, shared
 }
 
 // check records identity and key shape against the history recorded for
@@ -81,8 +104,11 @@ func (g *Guard[I]) check(key string, identity I) {
 	defer g.mu.Unlock()
 
 	if prev, ok := g.seenIdentity[key]; ok {
-		if prev != identity && g.onCollision != nil {
-			g.onCollision(g.op, key, prev, identity)
+		if prev != identity {
+			g.recorder.IncCollision(g.op)
+			if g.onCollision != nil {
+				g.onCollision(g.op, key, prev, identity)
+			}
 		}
 	} else {
 		g.seenIdentity[key] = identity
@@ -93,8 +119,11 @@ func (g *Guard[I]) check(key string, identity I) {
 		if !g.haveShape {
 			g.baseShape = shape
 			g.haveShape = true
-		} else if shape != g.baseShape && g.onDrift != nil {
-			g.onDrift(g.op, key, g.baseShape, shape)
+		} else if shape != g.baseShape {
+			g.recorder.IncDrift(g.op)
+			if g.onDrift != nil {
+				g.onDrift(g.op, key, g.baseShape, shape)
+			}
 		}
 	}
 }
