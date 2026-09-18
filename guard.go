@@ -1,6 +1,7 @@
 package singleflightguard
 
 import (
+	"fmt"
 	"sync"
 	"time"
 
@@ -27,11 +28,12 @@ type Guard[I comparable] struct {
 
 	op string
 
-	recorder       Recorder
-	onCollision    CollisionFunc[I]
-	onDrift        DriftFunc
-	driftDetection bool
-	keyShape       KeyShapeFunc
+	recorder          Recorder
+	onCollision       CollisionFunc[I]
+	onDrift           DriftFunc
+	refuseOnCollision bool
+	driftDetection    bool
+	keyShape          KeyShapeFunc
 
 	mu           sync.Mutex
 	seenIdentity map[string]I
@@ -75,7 +77,7 @@ func (g *Guard[I]) Do(key string, identity I, fn func() (any, error)) (v any, er
 	start := time.Now()
 	g.recorder.IncCall(g.op)
 
-	g.check(key, identity)
+	effectiveKey := g.check(key, identity)
 
 	// singleflight.Group only ever invokes the leader caller's fn for a
 	// given in-flight key; every other caller's fn argument is discarded
@@ -84,7 +86,7 @@ func (g *Guard[I]) Do(key string, identity I, fn func() (any, error)) (v any, er
 	// in-flight call. That's different from the shared return value below,
 	// which is true for every member of a shared group, leader included.
 	var executed bool
-	v, err, shared = g.group.Do(key, func() (any, error) {
+	v, err, shared = g.group.Do(effectiveKey, func() (any, error) {
 		executed = true
 		return fn()
 	})
@@ -96,18 +98,25 @@ func (g *Guard[I]) Do(key string, identity I, fn func() (any, error)) (v any, er
 	return v, err, shared
 }
 
-// check records identity and key shape against the history recorded for
-// this operation, reporting a collision or a drift event if either check
-// fails.
-func (g *Guard[I]) check(key string, identity I) {
+// check records/validates identity and key shape under lock, returning the
+// key that should actually be passed to the underlying singleflight.Group.
+// It's the same key unless a collision was detected and refuse-on-collision
+// is enabled, in which case a derived key is returned so the mismatched
+// caller doesn't share the original caller's in-flight result.
+func (g *Guard[I]) check(key string, identity I) string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+
+	effectiveKey := key
 
 	if prev, ok := g.seenIdentity[key]; ok {
 		if prev != identity {
 			g.recorder.IncCollision(g.op)
 			if g.onCollision != nil {
 				g.onCollision(g.op, key, prev, identity)
+			}
+			if g.refuseOnCollision {
+				effectiveKey = fmt.Sprintf("%s\x00collision\x00%v", key, identity)
 			}
 		}
 	} else {
@@ -126,4 +135,6 @@ func (g *Guard[I]) check(key string, identity I) {
 			}
 		}
 	}
+
+	return effectiveKey
 }

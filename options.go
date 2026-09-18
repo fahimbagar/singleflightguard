@@ -20,6 +20,17 @@ func WithOnCollision[I comparable](f CollisionFunc[I]) Option[I] {
 	return func(g *Guard[I]) { g.onCollision = f }
 }
 
+// WithRefuseOnCollision controls what happens to the call whose identity
+// collided with a previously-seen identity for the same key. When enabled,
+// that call is routed to a derived key so it triggers its own upstream
+// call instead of sharing the original caller's (provably wrong-for-it)
+// result. When disabled (the default), the collision is still reported,
+// but the call still shares the original result, trading correctness for
+// dedup efficiency on that one call.
+func WithRefuseOnCollision[I comparable](refuse bool) Option[I] {
+	return func(g *Guard[I]) { g.refuseOnCollision = refuse }
+}
+
 // DriftFunc is invoked when a Do call's key structural fingerprint differs
 // from the fingerprint previously established for the operation. That
 // difference is the signal that call sites are building keys
