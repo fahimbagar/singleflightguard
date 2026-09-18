@@ -19,8 +19,8 @@ import (
 // tenant/entity/version tuple the key is derived from).
 //
 // The underlying *singleflight.Group is held privately, not embedded: Do
-// is the only way in, so there's no path that bypasses Guard's tracking
-// the way an exported, promoted Group field would allow.
+// and DoChan are the only ways in, so there's no path that bypasses
+// Guard's tracking the way an exported, promoted Group field would allow.
 //
 // A *Guard is safe for concurrent use.
 type Guard[I comparable] struct {
@@ -47,10 +47,10 @@ type Guard[I comparable] struct {
 // "fetchModelDescriptor"), not the specific key.
 //
 // Guard owns its Group exclusively, and there's no way to reach it except
-// through Guard.Do: there's deliberately no way to hand New an existing
-// Group, and the Group isn't exposed as a field. Any other path to that
-// Group's own Do/DoChan would create exactly the blind spot Guard exists
-// to catch: calls Guard can't see, colliding with calls it can.
+// through Guard.Do/DoChan: there's deliberately no way to hand New an
+// existing Group, and the Group isn't exposed as a field. Any other path
+// to that Group's own Do/DoChan would create exactly the blind spot Guard
+// exists to catch: calls Guard can't see, colliding with calls it can.
 func New[I comparable](op string, opts ...Option[I]) *Guard[I] {
 	g := &Guard[I]{
 		group:          &singleflight.Group{},
@@ -96,6 +96,40 @@ func (g *Guard[I]) Do(key string, identity I, fn func() (any, error)) (v any, er
 		g.recorder.IncSuppressed(g.op)
 	}
 	return v, err, shared
+}
+
+// DoChan is like Do, but returns a channel that receives the result once
+// it's ready, mirroring singleflight.Group.DoChan. It applies the same
+// collision, drift, and metrics tracking Do does.
+//
+// Unlike Do, singleflight.Group.DoChan always runs fn in a new goroutine
+// (even for the leader), so the metrics recorded here can only happen once
+// the result actually arrives, not when DoChan returns. DoChan here
+// spawns one relay goroutine per call to bridge that gap; there's no way
+// to observe completion without one, since the underlying channel is the
+// only completion signal available.
+func (g *Guard[I]) DoChan(key string, identity I, fn func() (any, error)) <-chan singleflight.Result {
+	start := time.Now()
+	g.recorder.IncCall(g.op)
+
+	effectiveKey := g.check(key, identity)
+
+	var executed bool
+	inner := g.group.DoChan(effectiveKey, func() (any, error) {
+		executed = true
+		return fn()
+	})
+
+	out := make(chan singleflight.Result, 1)
+	go func() {
+		res := <-inner
+		g.recorder.ObserveDuration(g.op, time.Since(start))
+		if !executed {
+			g.recorder.IncSuppressed(g.op)
+		}
+		out <- res
+	}()
+	return out
 }
 
 // check records/validates identity and key shape under lock, returning the
