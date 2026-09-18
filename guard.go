@@ -18,9 +18,10 @@ import (
 // value uniquely identifies a request for that operation (e.g. the
 // tenant/entity/version tuple the key is derived from).
 //
-// The underlying *singleflight.Group is held privately, not embedded: Do
-// and DoChan are the only ways in, so there's no path that bypasses
-// Guard's tracking the way an exported, promoted Group field would allow.
+// The underlying *singleflight.Group is held privately, not embedded: Do,
+// DoChan, and Forget are the only ways in, so there's no path that
+// bypasses Guard's tracking the way an exported, promoted Group field
+// would allow.
 //
 // A *Guard is safe for concurrent use.
 type Guard[I comparable] struct {
@@ -47,10 +48,11 @@ type Guard[I comparable] struct {
 // "fetchModelDescriptor"), not the specific key.
 //
 // Guard owns its Group exclusively, and there's no way to reach it except
-// through Guard.Do/DoChan: there's deliberately no way to hand New an
-// existing Group, and the Group isn't exposed as a field. Any other path
-// to that Group's own Do/DoChan would create exactly the blind spot Guard
-// exists to catch: calls Guard can't see, colliding with calls it can.
+// through Guard.Do/DoChan/Forget: there's deliberately no way to hand New
+// an existing Group, and the Group isn't exposed as a field. Any other
+// path to that Group's own Do/DoChan would create exactly the blind spot
+// Guard exists to catch: calls Guard can't see, colliding with calls it
+// can.
 func New[I comparable](op string, opts ...Option[I]) *Guard[I] {
 	g := &Guard[I]{
 		group:          &singleflight.Group{},
@@ -130,6 +132,26 @@ func (g *Guard[I]) DoChan(key string, identity I, fn func() (any, error)) <-chan
 		out <- res
 	}()
 	return out
+}
+
+// Forget tells the underlying singleflight.Group to forget key, exactly
+// like singleflight.Group.Forget: a Do/DoChan call for key made after
+// Forget runs fn itself instead of waiting on a still-in-flight call.
+//
+// Forget also clears the identity Guard has on record for key, but not
+// the operation-wide drift shape baseline (that's not tied to any one
+// key). Without clearing the identity, a legitimate "forget this call and
+// retry with corrected params" flow would look identical to a collision
+// to check(): the retry's new identity would be compared against the
+// forgotten call's old one and flagged as a mismatch, even though Forget
+// is the caller's explicit signal that the old call is being superseded,
+// not collided with.
+func (g *Guard[I]) Forget(key string) {
+	g.mu.Lock()
+	delete(g.seenIdentity, key)
+	g.mu.Unlock()
+
+	g.group.Forget(key)
 }
 
 // check records/validates identity and key shape under lock, returning the
