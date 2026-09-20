@@ -266,11 +266,34 @@ func TestRefuseOnCollision(t *testing.T) {
 	<-started
 	time.Sleep(20 * time.Millisecond)
 
-	resultB, _, sharedB := g.Do(key, callerB, func() (any, error) {
-		return "B", nil
-	})
+	// B's call must not depend on A's in-flight call finishing: if
+	// collision refusal is working, B gets a derived key and its own
+	// upstream call, which returns immediately. Run it in a goroutine, and
+	// give it a moment to reach check() while A is still in flight (same
+	// idiom as <-started plus a sleep, above) before closing release,
+	// rather than after B returns. A regression that makes B coalesce
+	// onto A's call then fails this test cleanly on the assertions below
+	// instead of deadlocking the whole test binary, since closing release
+	// doesn't wait on B either way.
+	doneB := make(chan struct{})
+	var resultB any
+	var sharedB bool
+	go func() {
+		defer close(doneB)
+		resultB, _, sharedB = g.Do(key, callerB, func() (any, error) {
+			return "B", nil
+		})
+	}()
+	time.Sleep(20 * time.Millisecond)
+
 	close(release)
 	wg.Wait()
+
+	select {
+	case <-doneB:
+	case <-time.After(time.Second):
+		t.Fatal("B's call never returned; refuse-on-collision likely isn't diverting B to its own key")
+	}
 
 	if sharedB {
 		t.Fatalf("B's call reported shared=true, want a fresh call after collision refusal")
