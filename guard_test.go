@@ -280,6 +280,64 @@ func TestRefuseOnCollision(t *testing.T) {
 	}
 }
 
+// TestDoChanTracksCollisionAndSuppression checks that DoChan applies the
+// same collision detection and suppressed-call accounting as Do, since it
+// has its own separate bookkeeping path (a relay goroutine, not a direct
+// return) precisely because singleflight.Group.DoChan's result arrives
+// asynchronously.
+func TestDoChanTracksCollisionAndSuppression(t *testing.T) {
+	t.Parallel()
+
+	rec := &countingRecorder{}
+	var collisionCount int
+
+	g := New[descriptorKey]("op",
+		WithRecorder[descriptorKey](rec),
+		WithOnCollision(func(op, key string, prev, cur descriptorKey) {
+			collisionCount++
+		}),
+	)
+
+	callerA := descriptorKey{Tenant: "t1", Entity: "b|c", Version: "1"}
+	callerB := descriptorKey{Tenant: "t1", Entity: "b", Version: "c|1"}
+	const key = "t1|b|c|1"
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+
+	chA := g.DoChan(key, callerA, func() (any, error) {
+		close(started)
+		<-release
+		return "A", nil
+	})
+	<-started
+	time.Sleep(20 * time.Millisecond)
+
+	chB := g.DoChan(key, callerB, func() (any, error) {
+		return "B", nil
+	})
+	close(release)
+
+	resA := <-chA
+	resB := <-chB
+
+	if collisionCount != 1 {
+		t.Fatalf("collision callback fired %d times, want 1", collisionCount)
+	}
+	if resA.Val != "A" || resB.Val != "A" {
+		t.Fatalf("resA=%v resB=%v, want both to share A's result (refuse-on-collision is off)", resA.Val, resB.Val)
+	}
+	if !resB.Shared {
+		t.Fatalf("resB.Shared = false, want true (B coalesced onto A's in-flight call)")
+	}
+	if rec.calls != 2 {
+		t.Fatalf("calls = %d, want 2", rec.calls)
+	}
+	if rec.suppressed != 1 {
+		t.Fatalf("suppressed = %d, want 1 (B never ran its own fn)", rec.suppressed)
+	}
+}
+
 func mustDo(t *testing.T, g *Guard[string], key, identity string) {
 	t.Helper()
 	if _, err, _ := g.Do(key, identity, func() (any, error) { return nil, nil }); err != nil {
