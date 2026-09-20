@@ -114,3 +114,86 @@ func TestDoPropagatesError(t *testing.T) {
 		t.Fatalf("err = %v, want %v", err, wantErr)
 	}
 }
+
+// TestDriftDetected checks that call sites building structurally different
+// keys for the same operation are flagged, while consistent call sites
+// (same shape, different content) are not.
+func TestDriftDetected(t *testing.T) {
+	t.Parallel()
+
+	rec := &countingRecorder{}
+	var drifts []string
+	g := New[string]("fetchProduct",
+		WithRecorder[string](rec),
+		WithOnDrift[string](func(op, key, prevShape, curShape string) {
+			drifts = append(drifts, key)
+		}),
+	)
+
+	// Consistent call sites: numeric product IDs only.
+	mustDo(t, g, "12345", "id-12345")
+	mustDo(t, g, "67890", "id-67890")
+	if rec.drifts != 0 {
+		t.Fatalf("drifts = %d after consistent keys, want 0", rec.drifts)
+	}
+
+	// A different call site builds a SKU-shaped key for the same op.
+	mustDo(t, g, "sku-12345", "id-sku-12345")
+	if rec.drifts != 1 {
+		t.Fatalf("drifts = %d after inconsistent key, want 1", rec.drifts)
+	}
+	if len(drifts) != 1 || drifts[0] != "sku-12345" {
+		t.Fatalf("drift callback saw %v, want [sku-12345]", drifts)
+	}
+}
+
+func TestDriftDetectionCanBeDisabled(t *testing.T) {
+	t.Parallel()
+
+	rec := &countingRecorder{}
+	g := New[string]("op", WithRecorder[string](rec), WithDriftDetection[string](false))
+
+	mustDo(t, g, "12345", "a")
+	mustDo(t, g, "sku-12345", "b")
+	if rec.drifts != 0 {
+		t.Fatalf("drifts = %d with detection disabled, want 0", rec.drifts)
+	}
+}
+
+// TestWithKeyShape checks that a custom shape function actually replaces
+// DefaultKeyShape, in both directions: it must suppress drift reports
+// DefaultKeyShape would have raised, and still raise drift reports for
+// keys the custom function itself considers different.
+func TestWithKeyShape(t *testing.T) {
+	t.Parallel()
+
+	rec := &countingRecorder{}
+	firstCharShape := func(key string) string { return key[:1] }
+
+	g := New[string]("op",
+		WithRecorder[string](rec),
+		WithKeyShape[string](firstCharShape),
+	)
+
+	// DefaultKeyShape would flag "abc123" vs "aXYZ" as different shapes
+	// (letters vs. letters+digits); firstCharShape treats them the same.
+	mustDo(t, g, "abc123", "v1")
+	mustDo(t, g, "aXYZ", "v2")
+	if rec.drifts != 0 {
+		t.Fatalf("drifts = %d, want 0 (custom shape treats these keys as the same shape)", rec.drifts)
+	}
+
+	// A different first character is still a different shape under
+	// firstCharShape, proving the override is wired in, not ignored.
+	mustDo(t, g, "zzz", "v3")
+	if rec.drifts != 1 {
+		t.Fatalf("drifts = %d, want 1 (custom shape should still catch this one)", rec.drifts)
+	}
+}
+
+func mustDo(t *testing.T, g *Guard[string], key, identity string) {
+	t.Helper()
+	if _, err, _ := g.Do(key, identity, func() (any, error) { return nil, nil }); err != nil {
+		t.Fatalf("Do(%q) unexpected error: %v", key, err)
+	}
+}
