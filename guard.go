@@ -69,7 +69,7 @@ func New[I comparable](op string, opts ...Option[I]) *Guard[I] {
 }
 
 // Do runs fn under singleflight coordination for key, after checking key
-// against the identity history recorded for this operation.
+// against the identity and shape history recorded for this operation.
 //
 // The return shape matches singleflight.Group.Do exactly: the value, any
 // error from fn, and whether the result was shared with another in-flight
