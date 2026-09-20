@@ -338,6 +338,44 @@ func TestDoChanTracksCollisionAndSuppression(t *testing.T) {
 	}
 }
 
+// TestForget checks two things: Forget is a real passthrough to the
+// underlying singleflight.Group (a call already in flight when Forget
+// runs still completes normally and keeps sharing its result with anyone
+// already waiting on it, exactly like singleflight.Group.Forget
+// documents), and Forget clears Guard's own identity record for that key,
+// so a legitimate retry with a different identity right after isn't
+// mistaken for a collision.
+func TestForget(t *testing.T) {
+	t.Parallel()
+
+	var collisionCount int
+	g := New[string]("op",
+		WithOnCollision(func(op, key string, prev, cur string) { collisionCount++ }),
+	)
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+
+	ch := g.DoChan("k", "id-1", func() (any, error) {
+		close(started)
+		<-release
+		return "v", nil
+	})
+	<-started
+	g.Forget("k")
+	close(release)
+
+	res := <-ch
+	if res.Val != "v" || res.Err != nil {
+		t.Fatalf("res = %+v, want Val=v, Err=nil", res)
+	}
+
+	mustDo(t, g, "k", "id-2")
+	if collisionCount != 0 {
+		t.Fatalf("collisionCount = %d, want 0 (Forget should have cleared the old identity for this key)", collisionCount)
+	}
+}
+
 func mustDo(t *testing.T, g *Guard[string], key, identity string) {
 	t.Helper()
 	if _, err, _ := g.Do(key, identity, func() (any, error) { return nil, nil }); err != nil {
