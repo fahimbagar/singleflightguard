@@ -236,6 +236,50 @@ func TestWithKeyShape(t *testing.T) {
 	}
 }
 
+// TestRefuseOnCollision verifies that when enabled, the caller whose
+// identity collides gets its own upstream call instead of sharing the
+// original caller's result.
+func TestRefuseOnCollision(t *testing.T) {
+	t.Parallel()
+
+	g := New[descriptorKey]("op", WithRefuseOnCollision[descriptorKey](true))
+
+	callerA := descriptorKey{Tenant: "t1", Entity: "b|c", Version: "1"}
+	callerB := descriptorKey{Tenant: "t1", Entity: "b", Version: "c|1"}
+	const key = "t1|b|c|1"
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	var resultA any
+	go func() {
+		defer wg.Done()
+		resultA, _, _ = g.Do(key, callerA, func() (any, error) {
+			close(started)
+			<-release
+			return "A", nil
+		})
+	}()
+
+	<-started
+	time.Sleep(20 * time.Millisecond)
+
+	resultB, _, sharedB := g.Do(key, callerB, func() (any, error) {
+		return "B", nil
+	})
+	close(release)
+	wg.Wait()
+
+	if sharedB {
+		t.Fatalf("B's call reported shared=true, want a fresh call after collision refusal")
+	}
+	if resultA != "A" || resultB != "B" {
+		t.Fatalf("resultA=%v resultB=%v, want A and B kept separate", resultA, resultB)
+	}
+}
+
 func mustDo(t *testing.T, g *Guard[string], key, identity string) {
 	t.Helper()
 	if _, err, _ := g.Do(key, identity, func() (any, error) { return nil, nil }); err != nil {
