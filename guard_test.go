@@ -115,6 +115,51 @@ func TestDoPropagatesError(t *testing.T) {
 	}
 }
 
+// TestSuppressedCounted checks that concurrent calls with a consistent
+// key+identity correctly coalesce, and that the suppressed counter tracks
+// exactly the calls that didn't trigger their own fn.
+func TestSuppressedCounted(t *testing.T) {
+	t.Parallel()
+
+	rec := &countingRecorder{}
+	g := New[descriptorKey]("op", WithRecorder[descriptorKey](rec))
+
+	id := descriptorKey{Tenant: "t1", Entity: "b", Version: "1"}
+	release := make(chan struct{})
+	started := make(chan struct{})
+
+	const n = 5
+	var wg sync.WaitGroup
+	wg.Add(n)
+	var fnCalls int64
+	for i := 0; i < n; i++ {
+		go func() {
+			defer wg.Done()
+			_, _, _ = g.Do("t1|b|1", id, func() (any, error) {
+				atomic.AddInt64(&fnCalls, 1)
+				close(started)
+				<-release
+				return nil, nil
+			})
+		}()
+	}
+
+	<-started
+	time.Sleep(30 * time.Millisecond)
+	close(release)
+	wg.Wait()
+
+	if fnCalls != 1 {
+		t.Fatalf("fn ran %d times, want exactly 1 (singleflight coalescing broken)", fnCalls)
+	}
+	if rec.calls != n {
+		t.Fatalf("calls = %d, want %d", rec.calls, n)
+	}
+	if rec.suppressed != n-1 {
+		t.Fatalf("suppressed = %d, want %d", rec.suppressed, n-1)
+	}
+}
+
 // TestDriftDetected checks that call sites building structurally different
 // keys for the same operation are flagged, while consistent call sites
 // (same shape, different content) are not.
