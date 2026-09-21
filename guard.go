@@ -205,9 +205,14 @@ func (g *Guard[I]) Forget(key string) {
 // release for the same key, once the caller's Do/DoChan call completes;
 // that pairing is what keeps seenIdentity bounded to in-flight calls (see
 // the Guard doc comment) instead of growing for the life of the Guard.
+//
+// The recorder and onCollision/onDrift callbacks run after g.mu is
+// released, not while holding it: check only decides whether a report is
+// due and captures the values it needs, so a slow Recorder or callback
+// blocks the caller it happens on, not every other Do/DoChan call for this
+// operation.
 func (g *Guard[I]) check(key string, identity I) string {
 	g.mu.Lock()
-	defer g.mu.Unlock()
 
 	effectiveKey := key
 
@@ -218,11 +223,11 @@ func (g *Guard[I]) check(key string, identity I) string {
 	}
 	t.refs++
 
+	var collided bool
+	var prevIdentity I
 	if seen && t.identity != identity {
-		g.recorder.IncCollision(g.op)
-		if g.onCollision != nil {
-			g.onCollision(g.op, key, t.identity, identity)
-		}
+		collided = true
+		prevIdentity = t.identity
 		if g.refuseOnCollision {
 			effectiveKey = t.deriveKey(key, identity)
 		}
@@ -230,6 +235,8 @@ func (g *Guard[I]) check(key string, identity I) string {
 
 	// A key identical to the one that established the baseline can't have a
 	// different shape than itself, so there's nothing to hash or compare.
+	var drifted bool
+	var baseKeyAtDrift string
 	if g.driftDetection && (!g.haveShape || key != g.baseKey) {
 		hash := g.shapeHash(key)
 		if !g.haveShape {
@@ -237,10 +244,23 @@ func (g *Guard[I]) check(key string, identity I) string {
 			g.baseShapeHash = hash
 			g.haveShape = true
 		} else if hash != g.baseShapeHash {
-			g.recorder.IncDrift(g.op)
-			if g.onDrift != nil {
-				g.onDrift(g.op, key, g.shapeOf(g.baseKey), g.shapeOf(key))
-			}
+			drifted = true
+			baseKeyAtDrift = g.baseKey
+		}
+	}
+
+	g.mu.Unlock()
+
+	if collided {
+		g.recorder.IncCollision(g.op)
+		if g.onCollision != nil {
+			g.onCollision(g.op, key, prevIdentity, identity)
+		}
+	}
+	if drifted {
+		g.recorder.IncDrift(g.op)
+		if g.onDrift != nil {
+			g.onDrift(g.op, key, g.shapeOf(baseKeyAtDrift), g.shapeOf(key))
 		}
 	}
 

@@ -13,9 +13,9 @@ type CollisionFunc[I comparable] func(op, key string, prev, cur I)
 // detected (two calls, same key, different identities). Use it to log the
 // colliding identities with enough detail to fix the key formula.
 //
-// f runs while the Guard holds its internal per-operation mutex (see
-// Recorder.IncCollision), so keep it cheap: a slow callback blocks every
-// other Do call for that operation for as long as it runs.
+// f runs after Guard's internal per-operation lock has been released, so a
+// slow f blocks only the Do/DoChan call it's reported on, not other
+// concurrent callers.
 func WithOnCollision[I comparable](f CollisionFunc[I]) Option[I] {
 	return func(g *Guard[I]) { g.onCollision = f }
 }
@@ -43,8 +43,8 @@ type DriftFunc func(op, key, prevShape, curShape string)
 // WithOnDrift sets the callback invoked when key drift is detected (a
 // call's key shape differs from the operation's established shape).
 //
-// Same locking caveat as WithOnCollision: f runs under the Guard's
-// internal mutex, so keep it cheap.
+// Same as WithOnCollision: f runs after Guard's internal lock has been
+// released, so a slow f blocks only the call it's reported on.
 func WithOnDrift[I comparable](f DriftFunc) Option[I] {
 	return func(g *Guard[I]) { g.onDrift = f }
 }

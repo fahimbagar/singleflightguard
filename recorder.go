@@ -20,16 +20,11 @@ type Recorder interface {
 	// calls).
 	ObserveDuration(op string, d time.Duration)
 	// IncCollision is invoked when two calls shared a key but carried
-	// different identities. Unlike IncCall, IncSuppressed, and
-	// ObserveDuration, this runs while the Guard holds its internal
-	// per-operation mutex: a slow implementation blocks every other Do
-	// call for that operation for as long as it runs, so keep it cheap
-	// (an atomic increment, a non-blocking channel send).
+	// different identities.
 	IncCollision(op string)
 	// IncDrift is invoked when a call's key structural fingerprint
 	// differs from the fingerprint previously established for the
-	// operation. Same locking caveat as IncCollision: this also runs
-	// under the Guard's internal mutex, so keep it cheap.
+	// operation.
 	IncDrift(op string)
 }
 

@@ -327,6 +327,73 @@ func TestRefuseOnCollision(t *testing.T) {
 	}
 }
 
+// TestOnCollisionDoesNotBlockOtherKeys checks that a slow onCollision
+// callback only blocks the call it's reported on, not concurrent calls for
+// an unrelated key: check() must release Guard's lock before invoking it,
+// not hold the lock for the callback's duration.
+func TestOnCollisionDoesNotBlockOtherKeys(t *testing.T) {
+	t.Parallel()
+
+	releaseLeader := make(chan struct{})
+	startedLeader := make(chan struct{})
+	blockCollision := make(chan struct{})
+	inCollision := make(chan struct{})
+
+	g := New[string]("op", WithOnCollision(func(op, key string, prev, cur string) {
+		close(inCollision)
+		<-blockCollision
+	}))
+
+	doneLeader := make(chan struct{})
+	go func() {
+		defer close(doneLeader)
+		_, _, _ = g.Do("k1", "id-1", func() (any, error) {
+			close(startedLeader)
+			<-releaseLeader
+			return nil, nil
+		})
+	}()
+	<-startedLeader
+	time.Sleep(20 * time.Millisecond)
+
+	doneCollision := make(chan struct{})
+	go func() {
+		defer close(doneCollision)
+		_, _, _ = g.Do("k1", "id-2", func() (any, error) { return nil, nil })
+	}()
+
+	select {
+	case <-inCollision:
+	case <-time.After(time.Second):
+		t.Fatal("onCollision never started")
+	}
+
+	doneOther := make(chan struct{})
+	errOther := make(chan error, 1)
+	go func() {
+		defer close(doneOther)
+		_, err, _ := g.Do("k2", "id-3", func() (any, error) { return nil, nil })
+		errOther <- err
+	}()
+
+	select {
+	case <-doneOther:
+		if err := <-errOther; err != nil {
+			t.Fatalf("Do(k2) unexpected error: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Do for an unrelated key blocked on a concurrent onCollision callback")
+	}
+
+	// Refuse-on-collision is off, so the colliding call is a follower on
+	// the leader's still-in-flight call: it can't return until the leader
+	// does, so release the leader first.
+	close(blockCollision)
+	close(releaseLeader)
+	<-doneCollision
+	<-doneLeader
+}
+
 // TestDoChanTracksCollisionAndSuppression checks that DoChan applies the
 // same collision detection and suppressed-call accounting as Do, since it
 // has its own separate bookkeeping path (a relay goroutine, not a direct
