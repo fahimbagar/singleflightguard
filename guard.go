@@ -8,6 +8,22 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
+// identityShardCount is the number of independent identityShard stripes a
+// Guard splits its identity tracking across. A fixed, small count keeps
+// Guard's size predictable and avoids a runtime.GOMAXPROCS(0) dependency;
+// it only needs to be large enough that concurrent calls for different
+// keys usually land on different shards, not large enough to eliminate
+// collisions entirely.
+const identityShardCount = 16
+
+// identityShard is one stripe of Guard's identity tracking: its own mutex
+// guarding its own slice of seenIdentity, so calls for keys on different
+// shards don't serialize on each other. See the sharding note on Guard.
+type identityShard[I comparable] struct {
+	mu sync.Mutex
+	m  map[string]*trackedIdentity[I]
+}
+
 // Guard wraps a *singleflight.Group for a single named logical operation,
 // adding collision detection, drift detection, and call metrics on top of
 // unmodified singleflight coordination.
@@ -28,6 +44,15 @@ import (
 // many distinct keys an operation has seen over its lifetime, rather than
 // growing forever.
 //
+// Identity tracking is striped across identityShardCount shards, keyed by
+// a hash of the singleflight key, so concurrent calls for different keys
+// don't serialize on one lock. This only helps when one Guard sees many
+// distinct keys concurrently; it does nothing for the single-hot-key case
+// (many callers, one key), which is already bottlenecked by
+// singleflight.Group's own single internal lock regardless of Guard.
+// Drift detection state (the operation-wide shape baseline) stays under
+// its own single lock, separate from the shards, since it isn't per-key.
+//
 // The underlying *singleflight.Group is held privately, not embedded: Do,
 // DoChan, and Forget are the only ways in, so there's no path that
 // bypasses Guard's tracking the way an exported, promoted Group field
@@ -46,11 +71,20 @@ type Guard[I comparable] struct {
 	driftDetection    bool
 	keyShape          KeyShapeFunc // nil means DefaultKeyShape
 
-	mu            sync.Mutex
-	seenIdentity  map[string]*trackedIdentity[I]
+	shards [identityShardCount]identityShard[I]
+
+	driftMu       sync.Mutex
 	baseKey       string
 	baseShapeHash uint64
 	haveShape     bool
+}
+
+// shardFor returns the identityShard responsible for key, chosen by
+// hashing the key with the same allocation-free hash used for shape
+// comparison (see hashString in shape.go); reusing it here avoids a
+// second hashing scheme just for shard routing.
+func (g *Guard[I]) shardFor(key string) *identityShard[I] {
+	return &g.shards[hashString(key)%identityShardCount]
 }
 
 // trackedIdentity is the bookkeeping Guard keeps for one key while calls
@@ -104,7 +138,9 @@ func New[I comparable](op string, opts ...Option[I]) *Guard[I] {
 		op:             op,
 		recorder:       NoopRecorder{},
 		driftDetection: true,
-		seenIdentity:   make(map[string]*trackedIdentity[I]),
+	}
+	for i := range g.shards {
+		g.shards[i].m = make(map[string]*trackedIdentity[I])
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -195,31 +231,33 @@ func (g *Guard[I]) Forget(key string) {
 	g.group.Forget(key)
 }
 
-// check records/validates identity and key shape under lock, returning the
-// key that should actually be passed to the underlying singleflight.Group.
-// It's the same key unless a collision was detected and refuse-on-collision
-// is enabled, in which case a derived key is returned so the mismatched
+// check records/validates identity and key shape, returning the key that
+// should actually be passed to the underlying singleflight.Group. It's the
+// same key unless a collision was detected and refuse-on-collision is
+// enabled, in which case a derived key is returned so the mismatched
 // caller doesn't share the original caller's in-flight result.
 //
 // Every call to check must be paired with exactly one later call to
 // release for the same key, once the caller's Do/DoChan call completes;
-// that pairing is what keeps seenIdentity bounded to in-flight calls (see
-// the Guard doc comment) instead of growing for the life of the Guard.
+// that pairing is what keeps each shard's tracked identities bounded to
+// in-flight calls (see the Guard doc comment) instead of growing for the
+// life of the Guard.
 //
-// The recorder and onCollision/onDrift callbacks run after g.mu is
-// released, not while holding it: check only decides whether a report is
-// due and captures the values it needs, so a slow Recorder or callback
-// blocks the caller it happens on, not every other Do/DoChan call for this
-// operation.
+// The recorder and onCollision/onDrift callbacks run after the relevant
+// lock is released, not while holding it: check only decides whether a
+// report is due and captures the values it needs, so a slow Recorder or
+// callback blocks the caller it happens on, not every other Do/DoChan call
+// for this operation.
 func (g *Guard[I]) check(key string, identity I) string {
-	g.mu.Lock()
+	shard := g.shardFor(key)
+	shard.mu.Lock()
 
 	effectiveKey := key
 
-	t, seen := g.seenIdentity[key]
+	t, seen := shard.m[key]
 	if !seen {
 		t = &trackedIdentity[I]{identity: identity}
-		g.seenIdentity[key] = t
+		shard.m[key] = t
 	}
 	t.refs++
 
@@ -233,23 +271,29 @@ func (g *Guard[I]) check(key string, identity I) string {
 		}
 	}
 
+	shard.mu.Unlock()
+
 	// A key identical to the one that established the baseline can't have a
 	// different shape than itself, so there's nothing to hash or compare.
+	// Drift state is operation-wide, not per-key, so it lives under its own
+	// lock rather than a shard's.
 	var drifted bool
 	var baseKeyAtDrift string
-	if g.driftDetection && (!g.haveShape || key != g.baseKey) {
-		hash := g.shapeHash(key)
-		if !g.haveShape {
-			g.baseKey = key
-			g.baseShapeHash = hash
-			g.haveShape = true
-		} else if hash != g.baseShapeHash {
-			drifted = true
-			baseKeyAtDrift = g.baseKey
+	if g.driftDetection {
+		g.driftMu.Lock()
+		if !g.haveShape || key != g.baseKey {
+			hash := g.shapeHash(key)
+			if !g.haveShape {
+				g.baseKey = key
+				g.baseShapeHash = hash
+				g.haveShape = true
+			} else if hash != g.baseShapeHash {
+				drifted = true
+				baseKeyAtDrift = g.baseKey
+			}
 		}
+		g.driftMu.Unlock()
 	}
-
-	g.mu.Unlock()
 
 	if collided {
 		g.recorder.IncCollision(g.op)
@@ -269,20 +313,20 @@ func (g *Guard[I]) check(key string, identity I) string {
 
 // release marks one caller's use of key's tracked identity as done. Once
 // every caller that saw key via check has released it, the entry is
-// dropped, which is what keeps seenIdentity's size bounded by current
-// in-flight concurrency rather than by every key an operation has ever
-// seen.
+// dropped, which is what keeps a shard's size bounded by current in-flight
+// concurrency rather than by every key an operation has ever seen.
 func (g *Guard[I]) release(key string) {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+	shard := g.shardFor(key)
+	shard.mu.Lock()
+	defer shard.mu.Unlock()
 
-	t, ok := g.seenIdentity[key]
+	t, ok := shard.m[key]
 	if !ok {
 		return
 	}
 	t.refs--
 	if t.refs <= 0 {
-		delete(g.seenIdentity, key)
+		delete(shard.m, key)
 	}
 }
 

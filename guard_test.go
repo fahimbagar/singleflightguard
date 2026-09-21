@@ -524,12 +524,15 @@ func TestSeenIdentityBoundedToInFlight(t *testing.T) {
 		}
 	}
 
-	g.mu.Lock()
-	n := len(g.seenIdentity)
-	g.mu.Unlock()
+	n := 0
+	for i := range g.shards {
+		g.shards[i].mu.Lock()
+		n += len(g.shards[i].m)
+		g.shards[i].mu.Unlock()
+	}
 
 	if n != 0 {
-		t.Fatalf("seenIdentity has %d entries after all 1000 calls completed, want 0", n)
+		t.Fatalf("shards have %d tracked identities total after all 1000 calls completed, want 0", n)
 	}
 }
 
