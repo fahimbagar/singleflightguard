@@ -228,7 +228,9 @@ func (g *Guard[I]) check(key string, identity I) string {
 		}
 	}
 
-	if g.driftDetection {
+	// A key identical to the one that established the baseline can't have a
+	// different shape than itself, so there's nothing to hash or compare.
+	if g.driftDetection && (!g.haveShape || key != g.baseKey) {
 		hash := g.shapeHash(key)
 		if !g.haveShape {
 			g.baseKey = key

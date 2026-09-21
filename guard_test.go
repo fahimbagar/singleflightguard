@@ -238,6 +238,28 @@ func TestWithKeyShape(t *testing.T) {
 	}
 }
 
+// TestDriftSkipsRehashForUnchangedKey checks that check() doesn't call the
+// shape function at all for a key identical to the one that established
+// the baseline: its shape can't have changed, so there's nothing to learn
+// by recomputing it.
+func TestDriftSkipsRehashForUnchangedKey(t *testing.T) {
+	t.Parallel()
+
+	var calls int64
+	g := New[string]("op", WithKeyShape[string](func(key string) string {
+		atomic.AddInt64(&calls, 1)
+		return key
+	}))
+
+	for i := 0; i < 5; i++ {
+		mustDo(t, g, "same-key", "id")
+	}
+
+	if got := atomic.LoadInt64(&calls); got != 1 {
+		t.Fatalf("shape func called %d times for 5 calls with the same key, want 1 (the baseline call)", got)
+	}
+}
+
 // TestRefuseOnCollision verifies that when enabled, the caller whose
 // identity collides gets its own upstream call instead of sharing the
 // original caller's result.
