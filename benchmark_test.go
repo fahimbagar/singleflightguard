@@ -112,3 +112,75 @@ func BenchmarkGuard_SharedKeyRecording(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkGuard_CollisionEveryCall and BenchmarkGuard_CollisionEveryCallRefuse
+// measure the worst case for collision detection, as opposed to the happy
+// path measured by BenchmarkGuard_SharedKey above: many concurrent callers
+// share one key, but every caller carries a distinct identity, so nearly
+// every call detects a collision instead of none. The Refuse variant also
+// enables WithRefuseOnCollision, exercising the derived-key path. Each
+// reports its actual collision rate as a custom metric, to confirm the
+// scenario really is close to 100% collisions and not an accident of
+// timing (Guard's collision detection only fires between calls that
+// overlap in flight, so a sequential loop could never trigger this case).
+func BenchmarkGuard_CollisionEveryCall(b *testing.B) {
+	rec := &benchRecorder{}
+	g := singleflightguard.New[int64]("op", singleflightguard.WithRecorder[int64](rec))
+	b.ReportAllocs()
+	var n int64
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			id := atomic.AddInt64(&n, 1)
+			_, _, _ = g.Do("shared-key", id, func() (any, error) { return 42, nil })
+		}
+	})
+	b.ReportMetric(float64(rec.collisions.Load())/float64(b.N)*100, "collision-%")
+}
+
+func BenchmarkGuard_CollisionEveryCallRefuse(b *testing.B) {
+	rec := &benchRecorder{}
+	g := singleflightguard.New[int64]("op",
+		singleflightguard.WithRecorder[int64](rec),
+		singleflightguard.WithRefuseOnCollision[int64](true),
+	)
+	b.ReportAllocs()
+	var n int64
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			id := atomic.AddInt64(&n, 1)
+			_, _, _ = g.Do("shared-key", id, func() (any, error) { return 42, nil })
+		}
+	})
+	b.ReportMetric(float64(rec.collisions.Load())/float64(b.N)*100, "collision-%")
+}
+
+// BenchmarkGuard_DriftEveryCall measures the worst case for drift
+// detection, as opposed to the happy path (every other benchmark here uses
+// a single consistent key shape, so drift never fires): the first call
+// establishes one shape as the operation's baseline, then every later call
+// uses a different shape, so onDrift fires on nearly every call instead of
+// never. Keys are still unique per call, like BenchmarkGuard_UniqueKeys, so
+// this isolates drift-detection cost from coalescing. onDrift is set (a
+// no-op, as in BenchmarkGuard_SharedKeyRecording) because check() only
+// materializes the human-readable shape strings when onDrift is non-nil;
+// without one, this would measure counting a drift, not reporting it.
+func BenchmarkGuard_DriftEveryCall(b *testing.B) {
+	rec := &benchRecorder{}
+	g := singleflightguard.New[int]("op",
+		singleflightguard.WithRecorder[int](rec),
+		singleflightguard.WithOnDrift[int](func(op, key, prevShape, curShape string) {}),
+	)
+	b.ReportAllocs()
+	var v any
+	var err error
+	var shared bool
+	for i := 0; i < b.N; i++ {
+		key := fmt.Sprintf("key-%d", i) // shape "a-9"
+		if i == 0 {
+			key = fmt.Sprintf("%d", i) // shape "9", becomes the baseline
+		}
+		v, err, shared = g.Do(key, i, func() (any, error) { return i, nil })
+	}
+	sinkV, sinkErr, sinkShared = v, err, shared
+	b.ReportMetric(float64(rec.drifts.Load())/float64(b.N)*100, "drift-%")
+}
