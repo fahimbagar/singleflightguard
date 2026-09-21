@@ -44,12 +44,13 @@ type Guard[I comparable] struct {
 	onDrift           DriftFunc
 	refuseOnCollision bool
 	driftDetection    bool
-	keyShape          KeyShapeFunc
+	keyShape          KeyShapeFunc // nil means DefaultKeyShape
 
-	mu           sync.Mutex
-	seenIdentity map[string]*trackedIdentity[I]
-	baseShape    string
-	haveShape    bool
+	mu            sync.Mutex
+	seenIdentity  map[string]*trackedIdentity[I]
+	baseKey       string
+	baseShapeHash uint64
+	haveShape     bool
 }
 
 // trackedIdentity is the bookkeeping Guard keeps for one key while calls
@@ -103,7 +104,6 @@ func New[I comparable](op string, opts ...Option[I]) *Guard[I] {
 		op:             op,
 		recorder:       NoopRecorder{},
 		driftDetection: true,
-		keyShape:       DefaultKeyShape,
 		seenIdentity:   make(map[string]*trackedIdentity[I]),
 	}
 	for _, opt := range opts {
@@ -229,14 +229,15 @@ func (g *Guard[I]) check(key string, identity I) string {
 	}
 
 	if g.driftDetection {
-		shape := g.keyShape(key)
+		hash := g.shapeHash(key)
 		if !g.haveShape {
-			g.baseShape = shape
+			g.baseKey = key
+			g.baseShapeHash = hash
 			g.haveShape = true
-		} else if shape != g.baseShape {
+		} else if hash != g.baseShapeHash {
 			g.recorder.IncDrift(g.op)
 			if g.onDrift != nil {
-				g.onDrift(g.op, key, g.baseShape, shape)
+				g.onDrift(g.op, key, g.shapeOf(g.baseKey), g.shapeOf(key))
 			}
 		}
 	}
@@ -261,4 +262,22 @@ func (g *Guard[I]) release(key string) {
 	if t.refs <= 0 {
 		delete(g.seenIdentity, key)
 	}
+}
+
+// shapeHash returns a cheap, fixed-size fingerprint of key's shape,
+// suitable for the equality check on every Do/DoChan call. shapeOf
+// returns the same shape as a human-readable string, for the rarer path
+// (an actual drift report) where one is needed.
+func (g *Guard[I]) shapeHash(key string) uint64 {
+	if g.keyShape == nil {
+		return defaultKeyShapeHash(key)
+	}
+	return hashString(g.keyShape(key))
+}
+
+func (g *Guard[I]) shapeOf(key string) string {
+	if g.keyShape == nil {
+		return DefaultKeyShape(key)
+	}
+	return g.keyShape(key)
 }
