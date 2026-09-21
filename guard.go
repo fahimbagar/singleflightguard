@@ -18,6 +18,16 @@ import (
 // value uniquely identifies a request for that operation (e.g. the
 // tenant/entity/version tuple the key is derived from).
 //
+// Collision detection is scoped to calls that are actually in flight at
+// the same time: Guard remembers a key's identity only for as long as at
+// least one Do/DoChan call for it hasn't returned yet, then forgets it.
+// Two calls for the same key with different identities are caught when
+// they overlap, which is the scenario the package exists for (see doc.go);
+// the same mismatch across two calls that never overlap in time is not.
+// That bound is what keeps Guard's own memory footprint independent of how
+// many distinct keys an operation has seen over its lifetime, rather than
+// growing forever.
+//
 // The underlying *singleflight.Group is held privately, not embedded: Do,
 // DoChan, and Forget are the only ways in, so there's no path that
 // bypasses Guard's tracking the way an exported, promoted Group field
@@ -37,9 +47,17 @@ type Guard[I comparable] struct {
 	keyShape          KeyShapeFunc
 
 	mu           sync.Mutex
-	seenIdentity map[string]I
+	seenIdentity map[string]*trackedIdentity[I]
 	baseShape    string
 	haveShape    bool
+}
+
+// trackedIdentity is the bookkeeping Guard keeps for one key while calls
+// for it are in flight: the identity first seen for the key, and how many
+// current callers are relying on that entry.
+type trackedIdentity[I comparable] struct {
+	identity I
+	refs     int
 }
 
 // New creates a Guard for the named operation, with its own dedicated
@@ -60,7 +78,7 @@ func New[I comparable](op string, opts ...Option[I]) *Guard[I] {
 		recorder:       NoopRecorder{},
 		driftDetection: true,
 		keyShape:       DefaultKeyShape,
-		seenIdentity:   make(map[string]I),
+		seenIdentity:   make(map[string]*trackedIdentity[I]),
 	}
 	for _, opt := range opts {
 		opt(g)
@@ -80,6 +98,7 @@ func (g *Guard[I]) Do(key string, identity I, fn func() (any, error)) (v any, er
 	g.recorder.IncCall(g.op)
 
 	effectiveKey := g.check(key, identity)
+	defer g.release(key)
 
 	// singleflight.Group only ever invokes the leader caller's fn for a
 	// given in-flight key; every other caller's fn argument is discarded
@@ -125,6 +144,7 @@ func (g *Guard[I]) DoChan(key string, identity I, fn func() (any, error)) <-chan
 	out := make(chan singleflight.Result, 1)
 	go func() {
 		res := <-inner
+		g.release(key)
 		g.recorder.ObserveDuration(g.op, time.Since(start))
 		if !executed {
 			g.recorder.IncSuppressed(g.op)
@@ -138,19 +158,14 @@ func (g *Guard[I]) DoChan(key string, identity I, fn func() (any, error)) <-chan
 // like singleflight.Group.Forget: a Do/DoChan call for key made after
 // Forget runs fn itself instead of waiting on a still-in-flight call.
 //
-// Forget also clears the identity Guard has on record for key, but not
-// the operation-wide drift shape baseline (that's not tied to any one
-// key). Without clearing the identity, a legitimate "forget this call and
-// retry with corrected params" flow would look identical to a collision
-// to check(): the retry's new identity would be compared against the
-// forgotten call's old one and flagged as a mismatch, even though Forget
-// is the caller's explicit signal that the old call is being superseded,
-// not collided with.
+// Forget does not touch the identity Guard has on record for key. It
+// doesn't need to: that record is already released as soon as the call(s)
+// that created it return (see the Guard doc comment), so there's nothing
+// left over by the time a caller would think to call Forget for a
+// completed call. Deleting it here as well, for a call that's still in
+// flight, would race with that same call's own cleanup and could delete a
+// different, unrelated call's entry that happens to reuse key afterwards.
 func (g *Guard[I]) Forget(key string) {
-	g.mu.Lock()
-	delete(g.seenIdentity, key)
-	g.mu.Unlock()
-
 	g.group.Forget(key)
 }
 
@@ -159,24 +174,32 @@ func (g *Guard[I]) Forget(key string) {
 // It's the same key unless a collision was detected and refuse-on-collision
 // is enabled, in which case a derived key is returned so the mismatched
 // caller doesn't share the original caller's in-flight result.
+//
+// Every call to check must be paired with exactly one later call to
+// release for the same key, once the caller's Do/DoChan call completes;
+// that pairing is what keeps seenIdentity bounded to in-flight calls (see
+// the Guard doc comment) instead of growing for the life of the Guard.
 func (g *Guard[I]) check(key string, identity I) string {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 
 	effectiveKey := key
 
-	if prev, ok := g.seenIdentity[key]; ok {
-		if prev != identity {
-			g.recorder.IncCollision(g.op)
-			if g.onCollision != nil {
-				g.onCollision(g.op, key, prev, identity)
-			}
-			if g.refuseOnCollision {
-				effectiveKey = fmt.Sprintf("%s\x00collision\x00%v", key, identity)
-			}
+	t, seen := g.seenIdentity[key]
+	if !seen {
+		t = &trackedIdentity[I]{identity: identity}
+		g.seenIdentity[key] = t
+	}
+	t.refs++
+
+	if seen && t.identity != identity {
+		g.recorder.IncCollision(g.op)
+		if g.onCollision != nil {
+			g.onCollision(g.op, key, t.identity, identity)
 		}
-	} else {
-		g.seenIdentity[key] = identity
+		if g.refuseOnCollision {
+			effectiveKey = fmt.Sprintf("%s\x00collision\x00%v", key, identity)
+		}
 	}
 
 	if g.driftDetection {
@@ -193,4 +216,23 @@ func (g *Guard[I]) check(key string, identity I) string {
 	}
 
 	return effectiveKey
+}
+
+// release marks one caller's use of key's tracked identity as done. Once
+// every caller that saw key via check has released it, the entry is
+// dropped, which is what keeps seenIdentity's size bounded by current
+// in-flight concurrency rather than by every key an operation has ever
+// seen.
+func (g *Guard[I]) release(key string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	t, ok := g.seenIdentity[key]
+	if !ok {
+		return
+	}
+	t.refs--
+	if t.refs <= 0 {
+		delete(g.seenIdentity, key)
+	}
 }

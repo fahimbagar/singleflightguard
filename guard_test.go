@@ -2,6 +2,7 @@ package singleflightguard
 
 import (
 	"errors"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -361,13 +362,13 @@ func TestDoChanTracksCollisionAndSuppression(t *testing.T) {
 	}
 }
 
-// TestForget checks two things: Forget is a real passthrough to the
-// underlying singleflight.Group (a call already in flight when Forget
-// runs still completes normally and keeps sharing its result with anyone
-// already waiting on it, exactly like singleflight.Group.Forget
-// documents), and Forget clears Guard's own identity record for that key,
-// so a legitimate retry with a different identity right after isn't
-// mistaken for a collision.
+// TestForget checks Forget's one real job: a call for key made after
+// Forget gets its own upstream execution instead of waiting on a call for
+// key that's still in flight, exactly like singleflight.Group.Forget
+// documents. It uses the same identity both times, so a collision report
+// would mean Forget (or the surrounding refcounting) mishandled the
+// still-in-flight entry, not that the two calls' identities genuinely
+// disagreed.
 func TestForget(t *testing.T) {
 	t.Parallel()
 
@@ -386,16 +387,59 @@ func TestForget(t *testing.T) {
 	})
 	<-started
 	g.Forget("k")
-	close(release)
 
+	doneB := make(chan struct{})
+	var resultB any
+	var sharedB bool
+	go func() {
+		defer close(doneB)
+		resultB, _, sharedB = g.Do("k", "id-1", func() (any, error) { return "v2", nil })
+	}()
+
+	select {
+	case <-doneB:
+	case <-time.After(time.Second):
+		t.Fatal("Do after Forget never returned; Forget likely isn't reaching the underlying Group")
+	}
+	if sharedB {
+		t.Fatalf("sharedB = true, want false (Forget should have started a fresh call instead of coalescing with the still in-flight one)")
+	}
+	if resultB != "v2" {
+		t.Fatalf("resultB = %v, want v2", resultB)
+	}
+
+	close(release)
 	res := <-ch
 	if res.Val != "v" || res.Err != nil {
 		t.Fatalf("res = %+v, want Val=v, Err=nil", res)
 	}
-
-	mustDo(t, g, "k", "id-2")
 	if collisionCount != 0 {
-		t.Fatalf("collisionCount = %d, want 0 (Forget should have cleared the old identity for this key)", collisionCount)
+		t.Fatalf("collisionCount = %d, want 0 (both calls used the same identity)", collisionCount)
+	}
+}
+
+// TestSeenIdentityBoundedToInFlight checks that Guard's own bookkeeping
+// doesn't grow with the number of distinct keys an operation has ever
+// seen: once every call for a key has returned, nothing about that key is
+// left behind.
+func TestSeenIdentityBoundedToInFlight(t *testing.T) {
+	t.Parallel()
+
+	g := New[int]("op")
+
+	for i := 0; i < 1000; i++ {
+		key := "key-" + strconv.Itoa(i)
+		if _, err, _ := g.Do(key, i, func() (any, error) { return nil, nil }); err != nil {
+			t.Fatalf("Do(%q) unexpected error: %v", key, err)
+		}
+	}
+
+	g.mu.Lock()
+	n := len(g.seenIdentity)
+	g.mu.Unlock()
+
+	if n != 0 {
+		t.Fatalf("seenIdentity has %d entries after all 1000 calls completed, want 0", n)
 	}
 }
 

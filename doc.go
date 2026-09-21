@@ -6,9 +6,9 @@
 //     injective lets two genuinely different requests share one key, so
 //     singleflight coalesces them and one caller silently receives the
 //     other's result. Guard catches this by requiring callers to also pass
-//     a structured identity alongside the key; if two calls share a key but
-//     carry different identities, that's a collision, reported the moment
-//     it happens.
+//     a structured identity alongside the key; if two calls for the same
+//     key are in flight at the same time and carry different identities,
+//     that's a collision, reported the moment it happens.
 //
 //   - Drift (under-coalescing): different call sites for what's supposed to
 //     be the same logical operation build keys with inconsistent shape
