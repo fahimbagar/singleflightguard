@@ -97,7 +97,7 @@ func TestNoCollisionForRepeatedIdentity(t *testing.T) {
 
 	id := descriptorKey{Tenant: "t1", Entity: "b", Version: "1"}
 	for i := 0; i < 5; i++ {
-		g.Do("t1|b|1", id, func() (any, error) { return nil, nil })
+		_, _, _ = g.Do("t1|b|1", id, func() (any, error) { return nil, nil })
 	}
 	if rec.collisions != 0 {
 		t.Fatalf("collisions = %d, want 0", rec.collisions)
