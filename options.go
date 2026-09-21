@@ -52,12 +52,14 @@ func WithOnDrift[I comparable](f DriftFunc) Option[I] {
 // WithKeyShape overrides the structural fingerprint function used for
 // drift detection. Defaults to DefaultKeyShape.
 //
-// fn runs on every Do/DoChan call while drift detection is enabled, and
-// its result is hashed for comparison against the operation's baseline
-// shape rather than stored and compared as a string. As with any
-// fixed-size hash, two different shapes could in principle hash equal and
-// go undetected; at 64 bits and the small number of distinct shapes a
-// real operation produces, that's not a practical concern.
+// fn runs on most Do/DoChan calls while drift detection is enabled (it's
+// skipped for a key byte-identical to the one that established the
+// baseline, since that key's shape can't have changed), and its result is
+// hashed for comparison against the operation's baseline shape rather
+// than stored and compared as a string. As with any fixed-size hash, two
+// different shapes could in principle hash equal and go undetected; at 64
+// bits and the small number of distinct shapes a real operation produces,
+// that's not a practical concern.
 func WithKeyShape[I comparable](fn KeyShapeFunc) Option[I] {
 	return func(g *Guard[I]) { g.keyShape = fn }
 }

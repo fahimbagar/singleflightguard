@@ -100,9 +100,10 @@ func defaultKeyShapeHash(key string) uint64 {
 	return h
 }
 
-// hashString hashes an arbitrary shape string returned by a custom
-// KeyShapeFunc (set via WithKeyShape), so Guard can compare custom shapes
-// the same allocation-free way it compares the default one.
+// hashString is a generic allocation-free FNV-1a hash over a string's
+// bytes, used both to compare a custom KeyShapeFunc's result the same way
+// defaultKeyShapeHash compares the default shape, and to route a key to
+// one of Guard's identity shards (see shardFor in guard.go).
 func hashString(s string) uint64 {
 	h := fnvOffset64
 	for i := 0; i < len(s); i++ {
