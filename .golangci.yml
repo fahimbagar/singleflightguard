@@ -1,0 +1,48 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - bodyclose
+    - errorlint
+    - gosec
+    - makezero
+    - paralleltest
+    - revive
+    - unconvert
+    - unparam
+    - wastedassign
+  settings:
+    paralleltest:
+      ignore-missing-subtests: true
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - std-error-handling
+    rules:
+      - linters:
+          - revive
+          - unused
+        path: (.+)_test.go
+        text: ^(unused-parameter)|(.*is unused)
+
+      # Do's (v, err, shared) order intentionally mirrors
+      # singleflight.Group.Do's own signature; see guard.go's doc comment.
+      - linters:
+          - revive
+        path: guard.go
+        text: error-return
+
+issues:
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/fahimbagar/singleflightguard
