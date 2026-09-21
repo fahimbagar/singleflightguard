@@ -24,9 +24,12 @@ func WithOnCollision[I comparable](f CollisionFunc[I]) Option[I] {
 // collided with a previously-seen identity for the same key. When enabled,
 // that call is routed to a derived key so it triggers its own upstream
 // call instead of sharing the original caller's (provably wrong-for-it)
-// result. When disabled (the default), the collision is still reported,
-// but the call still shares the original result, trading correctness for
-// dedup efficiency on that one call.
+// result. Two different identities colliding on the same key always get
+// different derived keys, compared with I's own equality rather than by
+// formatting identity into a string, so they can never end up coalescing
+// with each other by accident. When disabled (the default), the collision
+// is still reported, but the call still shares the original result,
+// trading correctness for dedup efficiency on that one call.
 func WithRefuseOnCollision[I comparable](refuse bool) Option[I] {
 	return func(g *Guard[I]) { g.refuseOnCollision = refuse }
 }

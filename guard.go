@@ -53,11 +53,37 @@ type Guard[I comparable] struct {
 }
 
 // trackedIdentity is the bookkeeping Guard keeps for one key while calls
-// for it are in flight: the identity first seen for the key, and how many
-// current callers are relying on that entry.
+// for it are in flight: the identity first seen for the key, how many
+// current callers are relying on that entry, and (only once a collision
+// under WithRefuseOnCollision actually happens) the derived keys already
+// handed out to other identities colliding with it.
 type trackedIdentity[I comparable] struct {
 	identity I
 	refs     int
+
+	derived map[I]string
+	nextID  int
+}
+
+// deriveKey returns the singleflight key a colliding identity should use
+// instead of key, so it triggers its own upstream call rather than sharing
+// t's original caller's result. The same identity always gets back the
+// same derived key, so repeat calls from that identity still coalesce with
+// each other; different identities never collide with each other on the
+// derived key, since the lookup is keyed by I's own equality rather than
+// by formatting identity into a string (which isn't guaranteed injective
+// for arbitrary struct fields).
+func (t *trackedIdentity[I]) deriveKey(key string, identity I) string {
+	if derived, ok := t.derived[identity]; ok {
+		return derived
+	}
+	if t.derived == nil {
+		t.derived = make(map[I]string)
+	}
+	t.nextID++
+	derived := fmt.Sprintf("%s\x00collision\x00%d", key, t.nextID)
+	t.derived[identity] = derived
+	return derived
 }
 
 // New creates a Guard for the named operation, with its own dedicated
@@ -198,7 +224,7 @@ func (g *Guard[I]) check(key string, identity I) string {
 			g.onCollision(g.op, key, t.identity, identity)
 		}
 		if g.refuseOnCollision {
-			effectiveKey = fmt.Sprintf("%s\x00collision\x00%v", key, identity)
+			effectiveKey = t.deriveKey(key, identity)
 		}
 	}
 

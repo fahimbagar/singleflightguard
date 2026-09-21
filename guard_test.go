@@ -2,6 +2,7 @@ package singleflightguard
 
 import (
 	"errors"
+	"fmt"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -440,6 +441,93 @@ func TestSeenIdentityBoundedToInFlight(t *testing.T) {
 
 	if n != 0 {
 		t.Fatalf("seenIdentity has %d entries after all 1000 calls completed, want 0", n)
+	}
+}
+
+// TestRefuseOnCollisionDerivedKeysAreUnique guards the fix for a real bug:
+// deriving a collision key by formatting the identity with
+// fmt.Sprintf("%v", ...) isn't injective for a struct with
+// string fields, since %v joins fields with a plain space and doesn't
+// escape a space already inside a field value. ID{A: "a b", B: "c"} and
+// ID{A: "a", B: "b c"} format identically, so two genuinely different
+// colliding identities could derive the same key and get coalesced with
+// each other, defeating the whole point of WithRefuseOnCollision.
+func TestRefuseOnCollisionDerivedKeysAreUnique(t *testing.T) {
+	t.Parallel()
+
+	type id struct{ A, B string }
+
+	x := id{A: "a b", B: "c"}
+	y := id{A: "a", B: "b c"}
+	if fmt.Sprintf("%v", x) != fmt.Sprintf("%v", y) {
+		t.Fatalf("test setup invalid: %+v and %+v must format identically via %%v for this test to be meaningful", x, y)
+	}
+
+	g := New[id]("op", WithRefuseOnCollision[id](true))
+	leader := id{A: "leader", B: "leader"}
+	const key = "k"
+
+	release := make(chan struct{})
+	started := make(chan struct{})
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, _, _ = g.Do(key, leader, func() (any, error) {
+			close(started)
+			<-release
+			return "leader", nil
+		})
+	}()
+	<-started
+	time.Sleep(20 * time.Millisecond)
+
+	// x must still be in flight on its own derived key when y arrives: two
+	// calls only coalesce if they actually overlap, so a bug that makes x
+	// and y derive the same key would go unexercised without this.
+	releaseX := make(chan struct{})
+	startedX := make(chan struct{})
+	doneX := make(chan struct{})
+	var xVal any
+	var xShared bool
+	go func() {
+		defer close(doneX)
+		xVal, _, xShared = g.Do(key, x, func() (any, error) {
+			close(startedX)
+			<-releaseX
+			return "x", nil
+		})
+	}()
+	<-startedX
+	time.Sleep(20 * time.Millisecond)
+
+	doneY := make(chan struct{})
+	var yVal any
+	var yShared bool
+	go func() {
+		defer close(doneY)
+		yVal, _, yShared = g.Do(key, y, func() (any, error) { return "y", nil })
+	}()
+	time.Sleep(20 * time.Millisecond)
+
+	close(releaseX)
+	close(release)
+	wg.Wait()
+
+	for _, done := range []chan struct{}{doneX, doneY} {
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("a colliding call never returned; refuse-on-collision likely isn't diverting it to its own key")
+		}
+	}
+
+	if xShared || yShared {
+		t.Fatalf("xShared=%v yShared=%v, want both false: x and y must not coalesce with each other or the leader", xShared, yShared)
+	}
+	if xVal != "x" || yVal != "y" {
+		t.Fatalf("xVal=%v yVal=%v, want x and y kept separate despite formatting identically via %%v", xVal, yVal)
 	}
 }
 
